@@ -1,0 +1,54 @@
+"""
+lambda_preview.py — Lambda (image conteneur) de la route POST /preview.
+Handler : lambda_preview.handler
+L'image contient OCD (ocd_vehicle_models_py) + vehicle_preview.py + vehicle_validation.py + ocd_ego.py + ocd_vehicle_dynamics.py.
+Aucune permission AWS particulière (ne lit ni S3 ni DynamoDB).
+"""
+import base64, json, traceback
+from vehicle_validation import validate_vehicle_config
+from vehicle_preview import preview, PRESETS
+
+MAX_BODY = 200_000
+CORS = {"Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "POST,OPTIONS"}
+
+
+def _resp(code, obj):
+    return {"statusCode": code, "headers": {"Content-Type": "application/json", **CORS}, "body": json.dumps(obj)}
+
+
+def resolve_vehicle(v):
+    if isinstance(v, str):
+        if v.lower() not in PRESETS: raise ValueError(f"unknown vehicle: {v}")
+        return v.lower()
+    if isinstance(v, dict):
+        if v.get("enabled") is False: raise ValueError("dynamics model disabled")
+        cfg = v.get("ocd_vehicle", v)
+        errs = validate_vehicle_config(cfg)
+        if errs: raise ValueError("invalid vehicle: " + "; ".join(errs))
+        return cfg
+    raise ValueError("missing vehicle")
+
+
+def handler(event, context):
+    if (event.get("httpMethod") or "").upper() == "OPTIONS":
+        return _resp(204, {})
+    try:
+        raw = event.get("body") or "{}"
+        if event.get("isBase64Encoded"): raw = base64.b64decode(raw).decode()
+        if len(raw) > MAX_BODY: return _resp(413, {"error": "body too large"})
+        body = json.loads(raw)
+        veh = resolve_vehicle(body.get("vehicle"))
+        tc = body.get("test_case") or {}
+        ov = body.get("overrides") or {}
+        for k in ("drift_start_s", "lateral_rate_mps", "speed_kmh"):
+            if ov.get(k) is not None and not (0 <= float(ov[k]) <= 400): raise ValueError(f"{k} out of range")
+        if ov.get("lateral_rate_mps") is not None and not (0.05 <= float(ov["lateral_rate_mps"]) <= 3):
+            raise ValueError("lateral_rate_mps: 0.05 to 3 m/s")
+        return _resp(200, preview(veh, tc, ov))
+    except (ValueError, KeyError, TypeError) as e:
+        return _resp(400, {"error": str(e)})
+    except Exception as e:
+        traceback.print_exc()
+        return _resp(500, {"error": f"{type(e).__name__}: {e}"})

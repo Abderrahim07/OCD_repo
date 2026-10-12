@@ -1,0 +1,14 @@
+version: 0.2
+# CodeBuild : construit l'image de l'aperçu OCD et la pousse dans ECR.
+# Variables d'environnement du projet CodeBuild : AWS_ACCOUNT_ID, AWS_DEFAULT_REGION (eu-west-3)
+phases:
+  pre_build:
+    commands:
+      - REPO=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/vecu/ocd-preview
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - docker build -f Dockerfile.preview -t $REPO:latest .
+  post_build:
+    commands:
+      - docker push $REPO:latest
