@@ -6,7 +6,7 @@ Aucune permission AWS particulière (ne lit ni S3 ni DynamoDB).
 """
 import base64, json, traceback
 from vehicle_validation import validate_vehicle_config
-from vehicle_preview import preview, PRESETS
+from vehicle_preview import preview, profile, PRESETS
 
 MAX_BODY = 200_000
 CORS = {"Access-Control-Allow-Origin": "*",
@@ -25,13 +25,27 @@ def resolve_vehicle(v):
     if isinstance(v, dict):
         if v.get("enabled") is False: raise ValueError("dynamics model disabled")
         cfg = v.get("ocd_vehicle", v)
+        if isinstance(cfg, str): return resolve_vehicle(cfg)
         errs = validate_vehicle_config(cfg)
         if errs: raise ValueError("invalid vehicle: " + "; ".join(errs))
         return cfg
     raise ValueError("missing vehicle")
 
 
+def _direct(event):
+    """Appel direct (Lambda /run -> boto3 invoke), sans API Gateway : { "action": "profile", vehicle, test_case, overrides }."""
+    veh = resolve_vehicle(event.get("vehicle"))
+    tc = event.get("test_case") or {}
+    ov = event.get("overrides") or {}
+    return profile(veh, tc, ov)
+
+
 def handler(event, context):
+    if event.get("action") == "profile":          # appel interne (pas de HTTP)
+        try:
+            return {"ok": True, "profile": _direct(event)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     if (event.get("httpMethod") or "").upper() == "OPTIONS":
         return _resp(204, {})
     try:
