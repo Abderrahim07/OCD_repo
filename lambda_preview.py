@@ -6,9 +6,9 @@ Aucune permission AWS particulière (ne lit ni S3 ni DynamoDB).
 """
 import base64, json, traceback
 from vehicle_validation import validate_vehicle_config
-from vehicle_preview import preview, profile, PRESETS
+from vehicle_preview import preview, profile, response, PRESETS
 
-MAX_BODY = 200_000
+MAX_BODY = 400_000
 CORS = {"Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "POST,OPTIONS"}
@@ -40,10 +40,24 @@ def _direct(event):
     return profile(veh, tc, ov)
 
 
+def _response(body):
+    """Réponse du véhicule à la demande de braquage du firmware : { vehicle, t:[], steer_rad:[], speed_kmh, steer_ratio? }."""
+    veh = resolve_vehicle(body.get("vehicle"))
+    t, st = body.get("t"), body.get("steer_rad")
+    if not isinstance(t, list) or not isinstance(st, list): raise ValueError("t and steer_rad must be arrays")
+    t = [float(x) for x in t]; st = [float(x) for x in st]
+    return response(veh, t, st, float(body.get("speed_kmh")), steer_ratio=float(body.get("steer_ratio", 1.0)))
+
+
 def handler(event, context):
     if event.get("action") == "profile":          # appel interne (pas de HTTP)
         try:
             return {"ok": True, "profile": _direct(event)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if event.get("action") == "response":         # appel interne : réponse du véhicule à SteeringRequest_rad
+        try:
+            return {"ok": True, "response": _response(event)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     if (event.get("httpMethod") or "").upper() == "OPTIONS":
@@ -53,6 +67,8 @@ def handler(event, context):
         if event.get("isBase64Encoded"): raw = base64.b64decode(raw).decode()
         if len(raw) > MAX_BODY: return _resp(413, {"error": "body too large"})
         body = json.loads(raw)
+        if body.get("mode") == "response":
+            return _resp(200, _response(body))
         veh = resolve_vehicle(body.get("vehicle"))
         tc = body.get("test_case") or {}
         ov = body.get("overrides") or {}
