@@ -128,7 +128,7 @@ def simulate(vehicle, man, fps=20):
     # 1) mise en vitesse (mêmes lois que le preroll de OCDEgo, mais enregistrées)
     acc_t, acc_v, t = [0.0], [0.0], 0.0
     for _ in range(int(90.0 * fps)):
-        if abs(3.6 * ego._state["v_x_mps"] - speed) < 1.0:
+        if abs(3.6 * ego._state["v_x_mps"] - speed) < 0.2:
             break
         th, br = ego._speed_cmd(speed)
         ego._state = ego.model.step(th, 0.0, br, dt)
@@ -209,3 +209,108 @@ def preview(vehicle, test_case, overrides=None, fps=20):
     res["disclaimer"] = ("Forecast of the OCD dynamics model for the chosen vehicle. "
                          "Independent of the video: this is not the test result.")
     return res
+
+
+def profile(vehicle, test_case, overrides=None, fps=20):
+    """
+    Profil temporel du véhicule pour l'EXÉCUTION : ce que le firmware reçoit frame par frame.
+    Départ déjà à la vitesse du test case ; OCD simule ensuite la manœuvre.
+    Retourne des séries compactes (t, speed_kmh, ...) + le résumé de la manœuvre.
+    """
+    man = parse_test_case(test_case, overrides)
+    res = simulate(vehicle, man, fps)
+    S = res["series"]
+    return dict(
+        fps=fps,
+        t=S["t"], speed_kmh=S["v_kmh"], lat_m=S["lat_m"], yaw_deg=S["yaw_deg"],
+        steer_deg=S["steer_deg"], lat_acc_g=S["lat_acc_g"],
+        events=res["events"], warnings=res["warnings"],
+        maneuver={k: v for k, v in man.items() if not k.startswith("_")},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# RÉPONSE DU VÉHICULE À LA DEMANDE DE BRAQUAGE DU FIRMWARE (boucle ouverte)
+# ──────────────────────────────────────────────────────────────────────────
+MAX_STEER_RAD = 0.3          # angle_max_rad du PT1 de direction OCD : entrée normalisée 1.0 = 0,3 rad
+MAX_RESPONSE_POINTS = 2000
+
+
+def response(vehicle, t, steer_rad, speed_kmh, fps=20, steer_ratio=1.0):
+    """
+    Que ferait le véhicule si la demande de braquage du firmware (SteeringRequest_rad, frame par frame)
+    lui était appliquée ?   Boucle OUVERTE : la vidéo, l'écart mesuré par le firmware et son verdict
+    ne changent pas ; on regarde seulement la réponse du modèle (paramètres).
+
+    t, steer_rad : séries frame par frame issues de l'exécution (t en s, demande en rad, + = gauche)
+    speed_kmh    : vitesse de l'essai (le véhicule est déjà à cette vitesse à t = 0, régulée ensuite)
+    steer_ratio  : rad d'angle de roue pour 1 rad demandé (1.0 = la demande est un angle de roue ;
+                   1/16 ≈ la demande est un angle au volant)
+    Convention de sortie : latéral et lacet POSITIFS VERS LA GAUCHE (repère ISO d'OCD).
+    """
+    import math
+    n = len(steer_rad)
+    if n < 2 or n != len(t):
+        raise ValueError("t and steer_rad must have the same length (>= 2)")
+    if n > MAX_RESPONSE_POINTS:
+        raise ValueError(f"too many points (max {MAX_RESPONSE_POINTS})")
+    if not (5.0 <= float(speed_kmh) <= 400.0):
+        raise ValueError("speed_kmh: 5 to 400")
+    if not (0.001 <= abs(float(steer_ratio)) <= 10.0):
+        raise ValueError("steer_ratio out of range")
+    speed = float(speed_kmh)
+    cfg = PRESETS[vehicle.lower()] if isinstance(vehicle, str) else vehicle
+    ego = OCDEgo((0.0, 0.0, 0.0), cfg, fps)
+    dt = 1.0 / fps
+    warnings = []
+
+    # mise en vitesse (identique à simulate) — non affichée, t = 0 quand le véhicule est à la vitesse de l'essai
+    for _ in range(int(90.0 * fps)):
+        if abs(3.6 * ego._state["v_x_mps"] - speed) < 0.2:
+            break
+        th, br = ego._speed_cmd(speed)
+        ego._state = ego.model.step(th, 0.0, br, dt)
+    s0 = ego._state
+    ego._ref = (s0["x_m"], s0["y_m"], s0["psi_rad"])
+    v_start = 3.6 * s0["v_x_mps"]
+    if abs(v_start - speed) > 3.0:
+        warnings.append(f"The vehicle only reaches {v_start:.0f} km/h (target {speed:.0f} km/h): insufficient power for this speed.")
+
+    keys = ("t", "steer_req_deg", "steer_deg", "lat_m", "yaw_deg", "lat_acc_g", "v_kmh")
+    S = {k: [] for k in keys}
+    saturated = 0
+    for i in range(n):
+        wheel_rad = float(steer_rad[i]) * float(steer_ratio)
+        norm = wheel_rad / MAX_STEER_RAD
+        if abs(norm) > 1.0:
+            saturated += 1
+            norm = max(-1.0, min(1.0, norm))
+        th, br = ego._speed_cmd(speed)
+        ego._state = ego.model.step(th, norm, br, dt)          # OCD : + = gauche
+        x, y, yaw = ego.pose()                                   # repère CARLA (y, lacet positifs vers la droite)
+        full = ego.model.full_output()
+        S["t"].append(round(float(t[i]), 3))
+        S["steer_req_deg"].append(round(math.degrees(wheel_rad), 3))
+        S["steer_deg"].append(round(math.degrees(full.get("steering_angle_rad_fl", 0.0)), 3))
+        S["lat_m"].append(round(-y, 4) + 0.0)
+        S["yaw_deg"].append(round(-yaw, 3) + 0.0)
+        S["lat_acc_g"].append(round(full.get("lateral_accel_g", 0.0), 4))
+        S["v_kmh"].append(round(ego.speed_kmh, 2))
+
+    active = sum(1 for v in steer_rad if abs(float(v)) > 1e-9)
+    if active == 0:
+        warnings.append("The firmware never requested steering in this scenario (SteeringRequest_rad = 0 on every frame): the vehicle drives straight.")
+    if saturated:
+        warnings.append(f"{saturated} frame(s) exceed the steering actuator limit ({MAX_STEER_RAD} rad): the request was clipped.")
+    ev = dict(
+        steering_active_s=round(active * dt, 2),
+        peak_request_deg=round(max((abs(v) for v in S["steer_req_deg"]), default=0.0), 3),
+        max_lateral_m=round(max((abs(v) for v in S["lat_m"]), default=0.0), 3),
+        final_lateral_m=S["lat_m"][-1],
+        max_yaw_deg=round(max((abs(v) for v in S["yaw_deg"]), default=0.0), 3),
+        max_lateral_g=round(max((abs(v) for v in S["lat_acc_g"]), default=0.0), 3),
+    )
+    return dict(series=S, events=ev, warnings=warnings,
+                inputs=dict(speed_kmh=speed, steer_ratio=float(steer_ratio), fps=fps, frames=n),
+                disclaimer="Open loop: the camera image and the firmware's measured offset do not change. "
+                           "This is what the vehicle model would do if the firmware's steering request were applied. Lateral and yaw: + = left.")
